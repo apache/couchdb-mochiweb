@@ -57,26 +57,22 @@ loop(Socket, Opts, Body) ->
     request(Socket, Opts, Body).
 
 request(Socket, Opts, Body) ->
-    ok = mochiweb_socket:setopts(Socket, [{active, once}]),
-    receive
-        {Protocol, _, {http_request, Method, Path, Version}} when Protocol == http orelse Protocol == ssl ->
+    case mochiweb_socket:recv(Socket, 0, ?REQUEST_RECV_TIMEOUT) of
+        {ok, {http_request, Method, Path, Version}} ->
             ok = mochiweb_socket:setopts(Socket, [{packet, httph}]),
             headers(Socket, Opts, {Method, Path, Version}, [], Body, 0);
-        {Protocol, _, {http_error, "\r\n"}} when Protocol == http orelse Protocol == ssl ->
+        {error, {http_error, "\r\n"}} ->
             request(Socket, Opts, Body);
-        {Protocol, _, {http_error, "\n"}} when Protocol == http orelse Protocol == ssl ->
+        {error, {http_error, "\n"}} ->
             request(Socket, Opts, Body);
-        {tcp_closed, _} ->
+        {error, closed} ->
             mochiweb_socket:close(Socket),
             exit(normal);
-        {ssl_closed, _} ->
+        {error, timeout} ->
             mochiweb_socket:close(Socket),
             exit(normal);
         Other ->
             handle_invalid_msg_request(Other, Socket, Opts)
-    after ?REQUEST_RECV_TIMEOUT ->
-        mochiweb_socket:close(Socket),
-        exit(normal)
     end.
 
 reentry(Body) ->
@@ -89,23 +85,22 @@ headers(Socket, Opts, Request, Headers, _Body, ?MAX_HEADERS) ->
     ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
     handle_invalid_request(Socket, Opts, Request, Headers);
 headers(Socket, Opts, Request, Headers, Body, HeaderCount) ->
-    ok = mochiweb_socket:setopts(Socket, [{active, once}]),
-    receive
-        {Protocol, _, http_eoh} when Protocol == http orelse Protocol == ssl ->
+    case mochiweb_socket:recv(Socket, 0, ?REQUEST_RECV_TIMEOUT) of
+        {ok, http_eoh} ->
             Req = new_request(Socket, Opts, Request, Headers),
             call_body(Body, Req),
             ?MODULE:after_response(Body, Req);
-        {Protocol, _, {http_header, _, Name, _, Value}} when Protocol == http orelse Protocol == ssl ->
+        {ok, {http_header, _, Name, _, Value}} ->
             headers(Socket, Opts, Request, [{Name, Value} | Headers], Body,
                     1 + HeaderCount);
-        {tcp_closed, _} ->
+        {error, closed} ->
+            mochiweb_socket:close(Socket),
+            exit(normal);
+        {error, timeout} ->
             mochiweb_socket:close(Socket),
             exit(normal);
         Other ->
             handle_invalid_msg_request(Other, Socket, Opts, Request, Headers)
-    after ?HEADERS_RECV_TIMEOUT ->
-        mochiweb_socket:close(Socket),
-        exit(normal)
     end.
 
 call_body({M, F, A}, Req) ->
