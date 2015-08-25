@@ -8,24 +8,46 @@
 
 -include("internal.hrl").
 
--export([start_link/3, init/3]).
+-export([start_link/3, start_link/4, init/4]).
+
+-define(EMFILE_SLEEP_MSEC, 100).
 
 start_link(Server, Listen, Loop) ->
-    proc_lib:spawn_link(?MODULE, init, [Server, Listen, Loop]).
+    start_link(Server, Listen, Loop, []).
 
-init(Server, Listen, Loop) ->
+start_link(Server, Listen, Loop, Opts) ->
+    proc_lib:spawn_link(?MODULE, init, [Server, Listen, Loop, Opts]).
+
+do_accept(Server, Listen) ->
     T1 = os:timestamp(),
-    case catch mochiweb_socket:accept(Listen) of
+    case mochiweb_socket:transport_accept(Listen) of
         {ok, Socket} ->
             gen_server:cast(Server, {accepted, self(), timer:now_diff(os:timestamp(), T1)}),
-            call_loop(Loop, Socket);
-        {error, closed} ->
-            exit(normal);
-        {error, timeout} ->
-            init(Server, Listen, Loop);
-        {error, esslaccept} ->
+            mochiweb_socket:finish_accept(Socket);
+        Other ->
+            Other
+    end.
+
+init(Server, Listen, Loop, Opts) ->
+    case catch do_accept(Server, Listen) of
+        {ok, Socket} ->
+            call_loop(Loop, Socket, Opts);
+        {error, Err} when Err =:= closed orelse
+                          Err =:= esslaccept orelse
+                          Err =:= timeout ->
             exit(normal);
         Other ->
+            %% Mitigate out of file descriptor scenario by sleeping for a
+            %% short time to slow error rate
+            case Other of
+                {error, emfile} ->
+                    receive
+                    after ?EMFILE_SLEEP_MSEC ->
+                            ok
+                    end;
+                _ ->
+                    ok
+            end,
             error_logger:error_report(
               [{application, mochiweb},
                "Accept failed error",
@@ -33,18 +55,11 @@ init(Server, Listen, Loop) ->
             exit({error, accept_failed})
     end.
 
-call_loop({M, F}, Socket) ->
-    M:F(Socket);
-call_loop({M, F, [A1]}, Socket) ->
-    M:F(Socket, A1);
-call_loop({M, F, A}, Socket) ->
-    erlang:apply(M, F, [Socket | A]);
-call_loop(Loop, Socket) ->
-    Loop(Socket).
-
-%%
-%% Tests
-%%
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
--endif.
+call_loop({M, F}, Socket, Opts) ->
+    M:F(Socket, Opts);
+call_loop({M, F, [A1]}, Socket, Opts) ->
+    M:F(Socket, Opts, A1);
+call_loop({M, F, A}, Socket, Opts) ->
+    erlang:apply(M, F, [Socket, Opts | A]);
+call_loop(Loop, Socket, Opts) ->
+    Loop(Socket, Opts).
