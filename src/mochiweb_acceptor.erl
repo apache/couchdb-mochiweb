@@ -18,14 +18,13 @@ init(Server, Listen, Loop) ->
     case catch mochiweb_socket:accept(Listen) of
         {ok, Socket} ->
             gen_server:cast(Server, {accepted, self(), timer:now_diff(os:timestamp(), T1)}),
-            case mochiweb_socket:after_accept(Socket) of
-                ok -> call_loop(Loop, Socket);
-                {error, _} -> exit(normal)
-            end;
+            call_loop(Loop, Socket);
         {error, closed} ->
             exit(normal);
         {error, timeout} ->
             init(Server, Listen, Loop);
+        {error, esslaccept} ->
+            exit(normal);
         Other ->
             error_logger:error_report(
               [{application, mochiweb},
