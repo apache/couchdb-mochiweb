@@ -1,5 +1,23 @@
 %% @author Bob Ippolito <bob@mochimedia.com>
 %% @copyright 2007 Mochi Media, Inc.
+%%
+%% Permission is hereby granted, free of charge, to any person obtaining a
+%% copy of this software and associated documentation files (the "Software"),
+%% to deal in the Software without restriction, including without limitation
+%% the rights to use, copy, modify, merge, publish, distribute, sublicense,
+%% and/or sell copies of the Software, and to permit persons to whom the
+%% Software is furnished to do so, subject to the following conditions:
+%%
+%% The above copyright notice and this permission notice shall be included in
+%% all copies or substantial portions of the Software.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+%% THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+%% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+%% DEALINGS IN THE SOFTWARE.
 
 %% @doc HTTP server.
 
@@ -40,39 +58,53 @@ stop(Name) ->
 %%     Option = {name, atom()} | {ip, string() | tuple()} | {backlog, integer()}
 %%              | {nodelay, boolean()} | {acceptor_pool_size, integer()}
 %%              | {ssl, boolean()} | {profile_fun, undefined | (Props) -> ok}
-%%              | {link, false} | {recbuf, non_negative_integer()}
+%%              | {link, false} | {recbuf, undefined | non_negative_integer()}
 %% @doc Start a mochiweb server.
 %%      profile_fun is used to profile accept timing.
 %%      After each accept, if defined, profile_fun is called with a proplist of a subset of the mochiweb_socket_server state and timing information.
 %%      The proplist is as follows: [{name, Name}, {port, Port}, {active_sockets, ActiveSockets}, {timing, Timing}].
 %% @end
 start(Options) ->
+    ok = ensure_started(mochiweb_clock),
     mochiweb_socket_server:start(parse_options(Options)).
 
 start_link(Options) ->
+    ok = ensure_started(mochiweb_clock),
     mochiweb_socket_server:start_link(parse_options(Options)).
 
+ensure_started(M) ->
+    case M:start() of
+        {ok, _Pid} ->
+            ok;
+        {error, {already_started, _Pid}} ->
+            ok
+    end.
+
 loop(Socket, Opts, Body) ->
-    ok = mochiweb_socket:setopts(Socket, [{packet, http}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, http}])),
     request(Socket, Opts, Body).
 
 request(Socket, Opts, Body) ->
-    case mochiweb_socket:recv(Socket, 0, ?REQUEST_RECV_TIMEOUT) of
-        {ok, {http_request, Method, Path, Version}} ->
-            ok = mochiweb_socket:setopts(Socket, [{packet, httph}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{active, once}])),
+    receive
+        {Protocol, _, {http_request, Method, Path, Version}} when Protocol == http orelse Protocol == ssl ->
+            ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, httph}])),
             headers(Socket, Opts, {Method, Path, Version}, [], Body, 0);
-        {error, {http_error, "\r\n"}} ->
+        {Protocol, _, {http_error, "\r\n"}} when Protocol == http orelse Protocol == ssl ->
             request(Socket, Opts, Body);
-        {error, {http_error, "\n"}} ->
+        {Protocol, _, {http_error, "\n"}} when Protocol == http orelse Protocol == ssl ->
             request(Socket, Opts, Body);
-        {error, closed} ->
+        {tcp_closed, _} ->
             mochiweb_socket:close(Socket),
             exit(normal);
-        {error, timeout} ->
+        {tcp_error, _, emsgsize} = Other ->
+            handle_invalid_msg_request(Other, Socket, Opts);
+        {ssl_closed, _} ->
             mochiweb_socket:close(Socket),
-            exit(normal);
-        Other ->
-            handle_invalid_msg_request(Other, Socket, Opts)
+            exit(normal)
+    after ?REQUEST_RECV_TIMEOUT ->
+        mochiweb_socket:close(Socket),
+        exit(normal)
     end.
 
 reentry(Body) ->
@@ -82,25 +114,26 @@ reentry(Body) ->
 
 headers(Socket, Opts, Request, Headers, _Body, ?MAX_HEADERS) ->
     %% Too many headers sent, bad request.
-    ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, raw}])),
     handle_invalid_request(Socket, Opts, Request, Headers);
 headers(Socket, Opts, Request, Headers, Body, HeaderCount) ->
-    case mochiweb_socket:recv(Socket, 0, ?REQUEST_RECV_TIMEOUT) of
-        {ok, http_eoh} ->
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{active, once}])),
+    receive
+        {Protocol, _, http_eoh} when Protocol == http orelse Protocol == ssl ->
             Req = new_request(Socket, Opts, Request, Headers),
             call_body(Body, Req),
             ?MODULE:after_response(Body, Req);
-        {ok, {http_header, _, Name, _, Value}} ->
+        {Protocol, _, {http_header, _, Name, _, Value}} when Protocol == http orelse Protocol == ssl ->
             headers(Socket, Opts, Request, [{Name, Value} | Headers], Body,
                     1 + HeaderCount);
-        {error, closed} ->
+        {tcp_closed, _} ->
             mochiweb_socket:close(Socket),
             exit(normal);
-        {error, timeout} ->
-            mochiweb_socket:close(Socket),
-            exit(normal);
-        Other ->
+        {tcp_error, _, emsgsize} = Other ->
             handle_invalid_msg_request(Other, Socket, Opts, Request, Headers)
+    after ?HEADERS_RECV_TIMEOUT ->
+        mochiweb_socket:close(Socket),
+        exit(normal)
     end.
 
 call_body({M, F, A}, Req) ->
@@ -133,7 +166,7 @@ handle_invalid_request(Socket, Opts, Request, RevHeaders) ->
     exit(normal).
 
 new_request(Socket, Opts, Request, RevHeaders) ->
-    ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, raw}])),
     mochiweb:new_request({Socket, Opts, Request, lists:reverse(RevHeaders)}).
 
 after_response(Body, Req) ->

@@ -1,5 +1,23 @@
 %% @author Bob Ippolito <bob@mochimedia.com>
 %% @copyright 2007 Mochi Media, Inc.
+%%
+%% Permission is hereby granted, free of charge, to any person obtaining a
+%% copy of this software and associated documentation files (the "Software"),
+%% to deal in the Software without restriction, including without limitation
+%% the rights to use, copy, modify, merge, publish, distribute, sublicense,
+%% and/or sell copies of the Software, and to permit persons to whom the
+%% Software is furnished to do so, subject to the following conditions:
+%%
+%% The above copyright notice and this permission notice shall be included in
+%% all copies or substantial portions of the Software.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+%% THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+%% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+%% DEALINGS IN THE SOFTWARE.
 
 %% @doc MochiWeb HTTP Request abstraction.
 
@@ -13,7 +31,7 @@
 
 -export([new/5, new/6]).
 -export([get_header_value/2, get_primary_header_value/2, get_combined_header_value/2, get/2, dump/1]).
--export([send/2, recv/2, recv/3, recv_body/1, recv_body/2, stream_body/4]).
+-export([send/2, recv/2, recv/3, recv_body/1, recv_body/2, stream_body/4, stream_body/5]).
 -export([start_response/2, start_response_length/2, start_raw_response/2]).
 -export([respond/2, ok/2]).
 -export([not_found/1, not_found/2]).
@@ -101,6 +119,21 @@ get(peer, {?MODULE, [Socket, _Opts, _Method, _RawPath, _Version, _Headers]}=THIS
                 Hosts ->
                     string:strip(lists:last(string:tokens(Hosts, ",")))
             end;
+        %% Copied this syntax from webmachine contributor Steve Vinoski
+        {ok, {Addr={172, Second, _, _}, _Port}} when (Second > 15) andalso (Second < 32) ->
+            case get_header_value("x-forwarded-for", THIS) of
+                undefined ->
+                    inet_parse:ntoa(Addr);
+                Hosts ->
+                    string:strip(lists:last(string:tokens(Hosts, ",")))
+            end;
+        {ok, {Addr={192, 168, _, _}, _Port}} ->
+            case get_header_value("x-forwarded-for", THIS) of
+                undefined ->
+                    inet_parse:ntoa(Addr);
+                Hosts ->
+                    string:strip(lists:last(string:tokens(Hosts, ",")))
+            end;
         {ok, {{127, 0, 0, 1}, _Port}} ->
             case get_header_value("x-forwarded-for", THIS) of
                 undefined ->
@@ -117,7 +150,7 @@ get(path, {?MODULE, [_Socket, _Opts, _Method, RawPath, _Version, _Headers]}) ->
     case erlang:get(?SAVE_PATH) of
         undefined ->
             {Path0, _, _} = mochiweb_util:urlsplit_path(RawPath),
-            Path = mochiweb_util:unquote(Path0),
+            Path = mochiweb_util:normalize_path(mochiweb_util:unquote(Path0)),
             put(?SAVE_PATH, Path),
             Path;
         Cached ->
@@ -262,7 +295,7 @@ stream_body(MaxChunkSize, ChunkFun, FunState, MaxBodyLength,
             MaxBodyLength when is_integer(MaxBodyLength), MaxBodyLength < Length ->
                 exit({body_too_large, content_length});
             _ ->
-                stream_unchunked_body(Length, ChunkFun, FunState, THIS)
+                stream_unchunked_body(MaxChunkSize,Length, ChunkFun, FunState, THIS)
             end
     end.
 
@@ -308,12 +341,10 @@ format_response_header({Code, ResponseHeaders}, {?MODULE, [_Socket, _Opts, _Meth
                      false ->
                          HResponse1
                  end,
-    F = fun ({K, V}, Acc) ->
-                [mochiweb_util:make_io(K), <<": ">>, V, <<"\r\n">> | Acc]
-        end,
-    End = lists:foldl(F, [<<"\r\n">>], mochiweb_headers:to_list(HResponse2)),
+    End = [[mochiweb_util:make_io(K), <<": ">>, V, <<"\r\n">>]
+           || {K, V} <- mochiweb_headers:to_list(HResponse2)],
     Response = mochiweb:new_response({THIS, Code, HResponse2}),
-    {[make_version(Version), make_code(Code), <<"\r\n">> | End], Response};
+    {[make_version(Version), make_code(Code), <<"\r\n">> | [End, <<"\r\n">>]], Response};
 format_response_header({Code, ResponseHeaders, Length},
                        {?MODULE, [_Socket, _Opts, _Method, _RawPath, _Version, _Headers]}=THIS) ->
     HResponse = mochiweb_headers:make(ResponseHeaders),
@@ -526,28 +557,28 @@ stream_chunked_body(MaxChunkSize, Fun, FunState,
             stream_chunked_body(MaxChunkSize, Fun, NewState, THIS)
     end.
 
-stream_unchunked_body(0, Fun, FunState, {?MODULE, [_Socket, _Opts, _Method, _RawPath, _Version, _Headers]}) ->
+stream_unchunked_body(_MaxChunkSize, 0, Fun, FunState, {?MODULE, [_Socket, _Opts, _Method, _RawPath, _Version, _Headers]}) ->
     Fun({0, <<>>}, FunState);
-stream_unchunked_body(Length, Fun, FunState,
+stream_unchunked_body(MaxChunkSize, Length, Fun, FunState,
                       {?MODULE, [_Socket, Opts, _Method, _RawPath, _Version, _Headers]}=THIS) when Length > 0 ->
-    RecBuf = mochilists:get_value(recbuf, Opts, ?RECBUF_SIZE),
-    PktSize = case Length > RecBuf of
-        true ->
-            RecBuf;
-        false ->
-            Length
+    RecBuf = case mochilists:get_value(recbuf, Opts, ?RECBUF_SIZE) of
+        undefined -> %os controlled buffer size
+            MaxChunkSize;
+        Val  ->
+            Val
     end,
+    PktSize=min(Length,RecBuf),
     Bin = recv(PktSize, THIS),
     NewState = Fun({PktSize, Bin}, FunState),
-    stream_unchunked_body(Length - PktSize, Fun, NewState, THIS).
+    stream_unchunked_body(MaxChunkSize, Length - PktSize, Fun, NewState, THIS).
 
 %% @spec read_chunk_length(request()) -> integer()
 %% @doc Read the length of the next HTTP chunk.
 read_chunk_length({?MODULE, [Socket, _Opts, _Method, _RawPath, _Version, _Headers]}) ->
-    ok = mochiweb_socket:setopts(Socket, [{packet, line}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, line}])),
     case mochiweb_socket:recv(Socket, 0, ?IDLE_TIMEOUT) of
         {ok, Header} ->
-            ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
+            ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, raw}])),
             Splitter = fun (C) ->
                                C =/= $\r andalso C =/= $\n andalso C =/= $
                        end,
@@ -561,7 +592,7 @@ read_chunk_length({?MODULE, [Socket, _Opts, _Method, _RawPath, _Version, _Header
 %% @doc Read in a HTTP chunk of the given length. If Length is 0, then read the
 %%      HTTP footers (as a list of binaries, since they're nominal).
 read_chunk(0, {?MODULE, [Socket, _Opts, _Method, _RawPath, _Version, _Headers]}) ->
-    ok = mochiweb_socket:setopts(Socket, [{packet, line}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, line}])),
     F = fun (F1, Acc) ->
                 case mochiweb_socket:recv(Socket, 0, ?IDLE_TIMEOUT) of
                     {ok, <<"\r\n">>} ->
@@ -573,7 +604,7 @@ read_chunk(0, {?MODULE, [Socket, _Opts, _Method, _RawPath, _Version, _Headers]})
                 end
         end,
     Footers = F(F, []),
-    ok = mochiweb_socket:setopts(Socket, [{packet, raw}]),
+    ok = mochiweb_socket:exit_if_closed(mochiweb_socket:setopts(Socket, [{packet, raw}])),
     put(?SAVE_RECV, true),
     Footers;
 read_chunk(Length, {?MODULE, [Socket, _Opts, _Method, _RawPath, _Version, _Headers]}) ->
@@ -673,7 +704,7 @@ maybe_serve_file(File, ExtraHeaders, {?MODULE, [_Socket, _Opts, _Method, _RawPat
 
 server_headers() ->
     [{"Server", "MochiWeb/1.0 (" ++ ?QUIP ++ ")"},
-     {"Date", httpd_util:rfc1123_date()}].
+     {"Date", mochiweb_clock:rfc1123()}].
 
 make_code(X) when is_integer(X) ->
     [integer_to_list(X), [" " | httpd_util:reason_phrase(X)]];

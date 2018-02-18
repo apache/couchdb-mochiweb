@@ -1,5 +1,23 @@
 %% @author Bob Ippolito <bob@mochimedia.com>
 %% @copyright 2007 Mochi Media, Inc.
+%%
+%% Permission is hereby granted, free of charge, to any person obtaining a
+%% copy of this software and associated documentation files (the "Software"),
+%% to deal in the Software without restriction, including without limitation
+%% the rights to use, copy, modify, merge, publish, distribute, sublicense,
+%% and/or sell copies of the Software, and to permit persons to whom the
+%% Software is furnished to do so, subject to the following conditions:
+%%
+%% The above copyright notice and this permission notice shall be included in
+%% all copies or substantial portions of the Software.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+%% THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+%% FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+%% DEALINGS IN THE SOFTWARE.
 
 %% @doc Utilities for parsing multipart/form-data.
 
@@ -38,7 +56,7 @@ parts_to_body([{Start, End, Body}], ContentType, Size) ->
     {HeaderList, Body};
 parts_to_body(BodyList, ContentType, Size) when is_list(BodyList) ->
     parts_to_multipart_body(BodyList, ContentType, Size,
-                            mochihex:to_hex(crypto:rand_bytes(8))).
+                            mochihex:to_hex(crypto:strong_rand_bytes(8))).
 
 %% @spec parts_to_multipart_body([bodypart()], ContentType::string(),
 %%                               Size::integer(), Boundary::string()) ->
@@ -318,7 +336,7 @@ with_socket_server(Transport, ServerFun, ClientFun) ->
         plain ->
             gen_tcp:connect("127.0.0.1", Port, ClientOpts);
         ssl ->
-            ClientOpts1 = [{ssl_imp, new} | ClientOpts],
+            ClientOpts1 = mochiweb_test_util:ssl_client_opts(ClientOpts),
             {ok, SslSocket} = ssl:connect("127.0.0.1", Port, ClientOpts1),
             {ok, {ssl, SslSocket}}
     end,
